@@ -1,0 +1,30 @@
+name: RTL Verification CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  rtl-regression:
+    name: Icarus Verilog & Verilator Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout RTL Repository
+        uses: actions/checkout@v4
+
+      - name: Install Open-Source EDA Simulators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y iverilog verilator
+
+      - name: Run Verilator Static Synthesis & Width Lint
+        run: |
+          verilator --lint-only -Wall -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND --top-module apb_uart sync_fifo.sv uart_tx.sv uart_rx.sv apb_uart.sv
+
+      - name: Run UART PHY Loopback, Parity & Framing Error Regression
+        run: make sim_core
+
+      - name: Run AMBA APB3 Bus & 16-Byte Burst FIFO Regression
+        run: make sim_apb

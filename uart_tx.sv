@@ -1,72 +1,83 @@
 // =====================================================================
-// uart_tx.sv  -  Parameterized UART transmitter
-// FSM: IDLE -> START -> DATA(0..N-1) -> STOP -> IDLE
-// Author: Grimm
+// uart_tx.sv - Parameterized UART Transmitter with Runtime Baud & Parity
+// FSM: IDLE -> START -> DATA(0..N-1) -> PARITY(opt) -> STOP -> IDLE
+// Author: Le Thanh Danh (Danhle23)
 // =====================================================================
 `timescale 1ns/1ps
 
 module uart_tx #(
-    parameter int CLK_FREQ  = 50_000_000,  // system clock in Hz
-    parameter int BAUD_RATE = 115_200,     // baud rate in bps
-    parameter int DATA_BITS = 8
+    parameter int CLK_FREQ   = 50_000_000,
+    parameter int BAUD_RATE  = 115_200,
+    parameter int DATA_BITS  = 8,
+    parameter int DIV_WIDTH  = 16
 )(
     input  logic                 clk,
-    input  logic                 rst_n,     // active-low async reset
-    input  logic                 tx_start,  // pulse high to start a transfer
-    input  logic [DATA_BITS-1:0] tx_data,   // byte to transmit
-    output logic                 tx,        // serial output line
-    output logic                 tx_busy    // high while a frame is in flight
+    input  logic                 rst_n,
+    input  logic                 tx_start,
+    input  logic [DATA_BITS-1:0] tx_data,
+    input  logic [DIV_WIDTH-1:0] cfg_clk_div, // 0 => use default CLK_FREQ/BAUD_RATE
+    input  logic                 parity_en,
+    input  logic                 parity_odd,  // 0: even parity, 1: odd parity
+    output logic                 tx,
+    output logic                 tx_busy
 );
 
-    localparam int CLKS_PER_BIT = CLK_FREQ / BAUD_RATE;
+    localparam [DIV_WIDTH-1:0] DEFAULT_DIV = (CLK_FREQ / BAUD_RATE) > 2 ? (CLK_FREQ / BAUD_RATE) : 4;
 
-    typedef enum logic [1:0] {IDLE, START, DATA, STOP} state_t;
+    typedef enum logic [2:0] {IDLE, START, DATA, PARITY, STOP} state_t;
     state_t state;
 
-    logic [$clog2(CLKS_PER_BIT)-1:0] clk_cnt;
-    logic [$clog2(DATA_BITS)-1:0]    bit_idx;
-    logic [DATA_BITS-1:0]            shift_reg;
+    logic [DIV_WIDTH-1:0]         active_div;
+    logic [DIV_WIDTH-1:0]         clk_cnt;
+    logic [$clog2(DATA_BITS)-1:0] bit_idx;
+    logic [DATA_BITS-1:0]         shift_reg;
+    logic                         parity_bit;
+
+    wire [DIV_WIDTH-1:0] eff_div = (cfg_clk_div != '0) ? cfg_clk_div : DEFAULT_DIV;
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state     <= IDLE;
-            tx        <= 1'b1;          // line idles high
-            tx_busy   <= 1'b0;
-            clk_cnt   <= '0;
-            bit_idx   <= '0;
-            shift_reg <= '0;
+            state      <= IDLE;
+            tx         <= 1'b1;
+            tx_busy    <= 1'b0;
+            active_div <= DEFAULT_DIV;
+            clk_cnt    <= '0;
+            bit_idx    <= '0;
+            shift_reg  <= '0;
+            parity_bit <= 1'b0;
         end else begin
             case (state)
-                // ------------------------------------------------------
                 IDLE: begin
                     tx      <= 1'b1;
                     tx_busy <= 1'b0;
                     clk_cnt <= '0;
                     bit_idx <= '0;
                     if (tx_start) begin
-                        shift_reg <= tx_data;
-                        tx_busy   <= 1'b1;
-                        state     <= START;
+                        shift_reg  <= tx_data;
+                        active_div <= eff_div;
+                        parity_bit <= parity_odd ? ~(^tx_data) : (^tx_data);
+                        tx_busy    <= 1'b1;
+                        state      <= START;
                     end
                 end
-                // ------------------------------------------------------
-                START: begin            // drive the start bit (low)
+
+                START: begin
                     tx <= 1'b0;
-                    if (clk_cnt == CLKS_PER_BIT-1) begin
+                    if (clk_cnt == active_div - 1'b1) begin
                         clk_cnt <= '0;
                         state   <= DATA;
                     end else begin
                         clk_cnt <= clk_cnt + 1'b1;
                     end
                 end
-                // ------------------------------------------------------
-                DATA: begin             // shift out LSB first
+
+                DATA: begin
                     tx <= shift_reg[bit_idx];
-                    if (clk_cnt == CLKS_PER_BIT-1) begin
+                    if (clk_cnt == active_div - 1'b1) begin
                         clk_cnt <= '0;
-                        if (bit_idx == DATA_BITS-1) begin
+                        if (bit_idx == DATA_BITS - 1) begin
                             bit_idx <= '0;
-                            state   <= STOP;
+                            state   <= parity_en ? PARITY : STOP;
                         end else begin
                             bit_idx <= bit_idx + 1'b1;
                         end
@@ -74,10 +85,20 @@ module uart_tx #(
                         clk_cnt <= clk_cnt + 1'b1;
                     end
                 end
-                // ------------------------------------------------------
-                STOP: begin             // drive the stop bit (high)
+
+                PARITY: begin
+                    tx <= parity_bit;
+                    if (clk_cnt == active_div - 1'b1) begin
+                        clk_cnt <= '0;
+                        state   <= STOP;
+                    end else begin
+                        clk_cnt <= clk_cnt + 1'b1;
+                    end
+                end
+
+                STOP: begin
                     tx <= 1'b1;
-                    if (clk_cnt == CLKS_PER_BIT-1) begin
+                    if (clk_cnt == active_div - 1'b1) begin
                         clk_cnt <= '0;
                         tx_busy <= 1'b0;
                         state   <= IDLE;
@@ -85,7 +106,7 @@ module uart_tx #(
                         clk_cnt <= clk_cnt + 1'b1;
                     end
                 end
-                // ------------------------------------------------------
+
                 default: state <= IDLE;
             endcase
         end

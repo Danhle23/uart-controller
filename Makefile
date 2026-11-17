@@ -1,24 +1,27 @@
-# =====================================================================
-# Makefile - build & run the UART simulation with Icarus Verilog
-#   make sim    compile + run the self-checking testbench
-#   make wave   run, then open the waveform in GTKWave
-#   make clean  remove build artifacts
-# =====================================================================
-SIM    = iverilog
-VVP    = vvp
-FLAGS  = -g2012
-SRC    = uart_tx.sv uart_rx.sv uart_tb.sv
-TOP    = uart_tb
-BUILD  = sim.out
+# Makefile — Synthesizable UART & AMBA APB3 SoC IP Verification
+IVERILOG ?= iverilog
+VVP      ?= vvp
+FLAGS    := -g2012 -Wall
 
-.PHONY: sim wave clean
+RTL_CORE := uart_tx.sv uart_rx.sv
+RTL_SOC  := sync_fifo.sv $(RTL_CORE) apb_uart.sv
 
-sim: $(SRC)
-	$(SIM) $(FLAGS) -o $(BUILD) $(SRC)
-	$(VVP) $(BUILD)
+.PHONY: all sim sim_core sim_apb wave clean
 
-wave: sim
-	gtkwave dump.vcd &
+all: sim
+
+sim: sim_core sim_apb
+
+sim_core:
+	$(IVERILOG) $(FLAGS) -o sim_core.vvp $(RTL_CORE) uart_tb.sv
+	$(VVP) sim_core.vvp
+
+sim_apb:
+	$(IVERILOG) $(FLAGS) -o sim_apb.vvp $(RTL_SOC) apb_uart_tb.sv
+	$(VVP) sim_apb.vvp
+
+wave: sim_core
+	gtkwave uart_core.vcd &
 
 clean:
-	rm -f $(BUILD) dump.vcd
+	rm -f *.vvp *.vcd

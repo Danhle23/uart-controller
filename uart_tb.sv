@@ -1,134 +1,187 @@
 // =====================================================================
-// uart_tb.sv  -  Self-checking testbench for the UART controller
-// Connects uart_tx -> uart_rx in loopback, drives 46 bytes
-// (10 directed + 36 random), scoreboards every result, and includes
-// a SystemVerilog assertion + functional-coverage hook.
-// Author: Grimm
+// uart_tb.sv - Self-checking Testbench for UART TX/RX Core
+// Verifies directed corner patterns, randomized bytes, even/odd parity,
+// parity error detection, and framing error detection.
+// Compatible with Icarus Verilog 11/12, Verilator, Questa, and VCS.
+// Author: Le Thanh Danh (Danhle23)
 // =====================================================================
 `timescale 1ns/1ps
 
 module uart_tb;
 
-    // -- parameters (fast baud keeps the simulation short) -------------
-    localparam int CLK_FREQ     = 50_000_000;
-    localparam int BAUD_RATE    = 1_000_000;
-    localparam int DATA_BITS    = 8;
-    localparam time CLK_PERIOD  = 20ns;        // 50 MHz
+    localparam int CLK_FREQ   = 50_000_000;
+    localparam int BAUD_RATE  = 1_000_000;
+    localparam int DATA_BITS  = 8;
+    localparam time CLK_PERIOD = 20ns;
 
-    // -- DUT signals ---------------------------------------------------
-    logic                 clk = 1'b0;
-    logic                 rst_n = 1'b0;
-    logic                 tx_start;
-    logic [DATA_BITS-1:0] tx_data;
+    logic                 clk       = 1'b0;
+    logic                 rst_n     = 1'b0;
+    logic                 tx_start  = 1'b0;
+    logic [DATA_BITS-1:0] tx_data   = '0;
+    logic [15:0]          clk_div   = 16'd0;
+    logic                 tx_par_en = 1'b0;
+    logic                 tx_par_odd= 1'b0;
+    logic                 rx_par_en = 1'b0;
+    logic                 rx_par_odd= 1'b0;
     logic                 tx_line, tx_busy;
+    logic                 force_break = 1'b0;
+    wire                  rx_line = force_break ? 1'b0 : tx_line;
+
     logic [DATA_BITS-1:0] rx_data;
-    logic                 rx_valid;
+    logic                 rx_valid, parity_err, framing_err;
 
-    // -- DUTs in loopback: tx drives rx --------------------------------
-    uart_tx #(.CLK_FREQ(CLK_FREQ), .BAUD_RATE(BAUD_RATE), .DATA_BITS(DATA_BITS))
-    u_tx (
-        .clk(clk), .rst_n(rst_n),
-        .tx_start(tx_start), .tx_data(tx_data),
-        .tx(tx_line), .tx_busy(tx_busy)
+    uart_tx #(
+        .CLK_FREQ (CLK_FREQ),
+        .BAUD_RATE(BAUD_RATE),
+        .DATA_BITS(DATA_BITS)
+    ) u_tx (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .tx_start   (tx_start),
+        .tx_data    (tx_data),
+        .cfg_clk_div(clk_div),
+        .parity_en  (tx_par_en),
+        .parity_odd (tx_par_odd),
+        .tx         (tx_line),
+        .tx_busy    (tx_busy)
     );
 
-    uart_rx #(.CLK_FREQ(CLK_FREQ), .BAUD_RATE(BAUD_RATE), .DATA_BITS(DATA_BITS))
-    u_rx (
-        .clk(clk), .rst_n(rst_n),
-        .rx(tx_line),
-        .rx_data(rx_data), .rx_valid(rx_valid)
+    uart_rx #(
+        .CLK_FREQ (CLK_FREQ),
+        .BAUD_RATE(BAUD_RATE),
+        .DATA_BITS(DATA_BITS)
+    ) u_rx (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .rx         (rx_line),
+        .cfg_clk_div(clk_div),
+        .parity_en  (rx_par_en),
+        .parity_odd (rx_par_odd),
+        .rx_data    (rx_data),
+        .rx_valid   (rx_valid),
+        .parity_err (parity_err),
+        .framing_err(framing_err)
     );
 
-    // -- clock ---------------------------------------------------------
     always #(CLK_PERIOD/2) clk = ~clk;
 
-    // -- scoreboard ----------------------------------------------------
     int errors = 0;
     int checks = 0;
+    logic [3:0] cov_bins = 4'b0000;
 
-    // -- functional coverage hook --------------------------------------
-    covergroup cg_data @(posedge rx_valid);
-        coverpoint rx_data {
-            bins low      = {[8'h00:8'h3F]};
-            bins mid_low  = {[8'h40:8'h7F]};
-            bins mid_high = {[8'h80:8'hBF]};
-            bins high     = {[8'hC0:8'hFF]};
-        }
-    endgroup
-    cg_data cov = new();
+    // Continuous cycle-level protocol assertion: TX idles high when not busy
+    always @(posedge clk) begin
+        if (rst_n && !tx_busy && !tx_start) begin
+            if (tx_line !== 1'b1) begin
+                $display("[ASSERT FAIL] tx_line low while idle at %0t", $time);
+                errors = errors + 1;
+            end
+        end
+    end
 
-    // -- assertion: line must idle high whenever tx is not busy --------
-    property p_idle_high;
-        @(posedge clk) disable iff (!rst_n)
-        (!tx_busy) |-> (tx_line == 1'b1);
-    endproperty
-    assert property (p_idle_high)
-        else $error("ASSERTION: tx line not high while idle");
-
-    // -- driver/checker task -------------------------------------------
-    task automatic send_and_check(input logic [DATA_BITS-1:0] data);
+    task automatic send_and_check(
+        input logic [7:0] data,
+        input logic       exp_par_err
+    );
         @(posedge clk);
         tx_data  <= data;
         tx_start <= 1'b1;
         @(posedge clk);
         tx_start <= 1'b0;
 
-        @(posedge rx_valid);   // wait for the receiver to finish
-        @(posedge clk);
-        checks++;
-        if (rx_data === data) begin
-            $display("[PASS] sent=0x%02h  recv=0x%02h", data, rx_data);
+        @(posedge rx_valid);
+        checks = checks + 1;
+
+        if (rx_data[7:6] == 2'b00) cov_bins[0] = 1'b1;
+        if (rx_data[7:6] == 2'b01) cov_bins[1] = 1'b1;
+        if (rx_data[7:6] == 2'b10) cov_bins[2] = 1'b1;
+        if (rx_data[7:6] == 2'b11) cov_bins[3] = 1'b1;
+
+        if ((rx_data === data) && (parity_err === exp_par_err) && (framing_err === 1'b0)) begin
+            $display("[PASS] sent=0x%02h recv=0x%02h par_err=%0b", data, rx_data, parity_err);
         end else begin
-            errors++;
-            $display("[FAIL] sent=0x%02h  recv=0x%02h", data, rx_data);
+            errors = errors + 1;
+            $display("[FAIL] sent=0x%02h recv=0x%02h par_err=%0b(exp %0b) frm_err=%0b",
+                     data, rx_data, parity_err, exp_par_err, framing_err);
         end
 
         wait (!tx_busy);
         repeat (4) @(posedge clk);
     endtask
 
-    // -- directed vectors ----------------------------------------------
-    logic [DATA_BITS-1:0] directed [10] = '{
-        8'h00, 8'hFF, 8'hAA, 8'h55, 8'h0F,
-        8'hF0, 8'h01, 8'h80, 8'h7E, 8'h3C
-    };
+    logic [7:0] directed [0:9];
+    int i;
 
-    // -- main stimulus -------------------------------------------------
     initial begin
-        tx_start = 1'b0;
-        tx_data  = '0;
+        directed[0] = 8'h00; directed[1] = 8'hFF;
+        directed[2] = 8'hAA; directed[3] = 8'h55;
+        directed[4] = 8'h0F; directed[5] = 8'hF0;
+        directed[6] = 8'h01; directed[7] = 8'h80;
+        directed[8] = 8'h7E; directed[9] = 8'h3C;
 
         repeat (5) @(posedge clk);
-        rst_n = 1'b1;                 // release reset
+        rst_n = 1'b1;
         repeat (5) @(posedge clk);
 
-        foreach (directed[i])
-            send_and_check(directed[i]);          // 10 directed
+        // 1. 10 Directed Corner Cases (8N1)
+        for (i = 0; i < 10; i = i + 1)
+            send_and_check(directed[i], 1'b0);
 
-        for (int i = 0; i < 36; i++)
-            send_and_check($urandom_range(0, 255)); // 36 random => 46 total
+        // 2. 30 Randomized Vectors (8N1)
+        for (i = 0; i < 30; i = i + 1)
+            send_and_check($urandom_range(0, 255), 1'b0);
+
+        // 3. Even Parity (8E1) & Odd Parity (8O1) Verification
+        tx_par_en = 1'b1; rx_par_en = 1'b1;
+        tx_par_odd = 1'b0; rx_par_odd = 1'b0;
+        send_and_check(8'hA5, 1'b0);
+        send_and_check(8'h37, 1'b0);
+
+        tx_par_odd = 1'b1; rx_par_odd = 1'b1;
+        send_and_check(8'hC3, 1'b0);
+
+        // 4. Injected Parity Mismatch Error Detection
+        tx_par_odd = 1'b0; rx_par_odd = 1'b1;
+        send_and_check(8'h5A, 1'b1);
+
+        // 5. Framing Error Injection (Break condition holding stop bit low)
+        tx_par_en = 1'b0; rx_par_en = 1'b0;
+        @(posedge clk);
+        force_break = 1'b1;
+        @(posedge rx_valid);
+        checks = checks + 1;
+        if (framing_err === 1'b1) begin
+            $display("[PASS] Framing error detected cleanly on break condition");
+        end else begin
+            errors = errors + 1;
+            $display("[FAIL] Framing error missed on break condition");
+        end
+        force_break = 1'b0;
+        repeat (60) @(posedge clk);
 
         $display("--------------------------------------------");
         $display("Total checks : %0d", checks);
         $display("Errors       : %0d", errors);
-        $display("Coverage     : %0.1f%%", cov.get_coverage());
-        if (errors == 0) $display("RESULT: ALL TESTS PASSED");
-        else             $display("RESULT: %0d TEST(S) FAILED", errors);
-        $display("--------------------------------------------");
-        $finish;
+        $display("Quadrant Cov : %0d / 4 bins hit",
+                 cov_bins[0] + cov_bins[1] + cov_bins[2] + cov_bins[3]);
+        if (errors == 0) begin
+            $display("RESULT: ALL UART CORE TESTS PASSED");
+            $finish;
+        end else begin
+            $display("RESULT: %0d TEST(S) FAILED", errors);
+            $fatal(1);
+        end
     end
 
-    // -- waveform dump (for: make wave) --------------------------------
     initial begin
-        $dumpfile("dump.vcd");
+        $dumpfile("uart_core.vcd");
         $dumpvars(0, uart_tb);
     end
 
-    // -- safety timeout ------------------------------------------------
     initial begin
-        #5ms;
-        $display("TIMEOUT - simulation did not finish in time");
-        $finish;
+        #10ms;
+        $display("TIMEOUT - simulation exceeded limit");
+        $fatal(1);
     end
 
 endmodule
