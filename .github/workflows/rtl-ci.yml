@@ -14,14 +14,18 @@ jobs:
       - name: Checkout RTL Repository
         uses: actions/checkout@v4
 
-      - name: Install Open-Source EDA Simulators
+      - name: Install Open-Source EDA Simulators & Synthesizer
         run: |
           sudo apt-get update
-          sudo apt-get install -y iverilog verilator
+          sudo apt-get install -y iverilog verilator yosys
 
       - name: Run Verilator Static Synthesis & Width Lint
         run: |
           verilator --lint-only -Wall -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND --top-module apb_uart sync_fifo.sv uart_tx.sv uart_rx.sv apb_uart.sv
+
+      - name: Run Yosys Open-Source Gate-Level Synthesis & Area Report
+        run: |
+          yosys -p "read_verilog -sv sync_fifo.sv uart_tx.sv uart_rx.sv apb_uart.sv; synth -top apb_uart; stat"
 
       - name: Run UART PHY Loopback, Parity & Framing Error Regression
         run: make sim_core
